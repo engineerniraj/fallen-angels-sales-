@@ -1,8 +1,13 @@
 import io
+import zipfile
 from copy import copy
 
 import openpyxl
 import streamlit as st
+from PIL import Image
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
 
 st.set_page_config(page_title="Niraj Excel Tools", page_icon="📊", layout="wide")
 
@@ -191,6 +196,64 @@ def simple_excel_column_updater():
             st.error(f"Could not update the file: {exc}")
 
 
+def heic_to_jpg_converter():
+    st.header("HEIC to JPG Converter")
+    st.caption("Convert iPhone HEIC/HEIF photos to JPG. No API key needed; conversion happens inside the Streamlit app.")
+
+    uploaded_files = st.file_uploader(
+        "Upload HEIC/HEIF images",
+        type=["heic", "heif"],
+        accept_multiple_files=True,
+        key="heic-files",
+    )
+
+    quality = st.slider("JPG quality", min_value=60, max_value=100, value=90, step=5)
+
+    if not uploaded_files:
+        st.info("Upload one or more .heic or .heif files to convert them into JPG.")
+        return
+
+    converted_files = []
+    for uploaded_file in uploaded_files:
+        try:
+            image = Image.open(uploaded_file)
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=quality, optimize=True)
+            output.seek(0)
+
+            base_name = uploaded_file.name.rsplit(".", 1)[0]
+            jpg_name = f"{base_name}.jpg"
+            converted_files.append((jpg_name, output.getvalue()))
+
+            st.success(f"Converted: {uploaded_file.name} → {jpg_name}")
+            st.image(output.getvalue(), caption=jpg_name, use_container_width=True)
+            st.download_button(
+                f"Download {jpg_name}",
+                data=output.getvalue(),
+                file_name=jpg_name,
+                mime="image/jpeg",
+                key=f"download-{jpg_name}",
+            )
+        except Exception as exc:
+            st.error(f"Could not convert {uploaded_file.name}: {exc}")
+
+    if len(converted_files) > 1:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_name, file_bytes in converted_files:
+                zip_file.writestr(file_name, file_bytes)
+        zip_buffer.seek(0)
+        st.download_button(
+            "Download all JPG files as ZIP",
+            data=zip_buffer,
+            file_name="converted_jpg_files.zip",
+            mime="application/zip",
+        )
+
+
 def main():
     st.title("Niraj Excel Tools")
     st.caption("One free no-API app for manual and fixed Excel tasks.")
@@ -200,6 +263,7 @@ def main():
         [
             "Fallen Angels retail updater",
             "Simple Excel column updater",
+            "HEIC to JPG Converter",
         ],
     )
 
@@ -209,6 +273,8 @@ def main():
         fallen_angels_processor()
     elif task == "Simple Excel column updater":
         simple_excel_column_updater()
+    elif task == "HEIC to JPG Converter":
+        heic_to_jpg_converter()
 
 
 if __name__ == "__main__":
