@@ -4,7 +4,7 @@ from copy import copy
 import openpyxl
 import streamlit as st
 
-st.set_page_config(page_title="Fallen Angels Sales Processor", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Niraj Excel Tools", page_icon="📊", layout="wide")
 
 COLUMN_I = 9
 
@@ -105,8 +105,8 @@ def build_download(master_file, sheet_entries):
     return output, summary
 
 
-def main():
-    st.title("Fallen Angels Sales Report Processor")
+def fallen_angels_processor():
+    st.header("Fallen Angels Sales Report Processor")
     st.caption("No API key needed. Staff enter the retail quantities from each invoice, then download the finished Excel file.")
 
     with st.expander("How to use", expanded=True):
@@ -117,7 +117,7 @@ def main():
         4. Download the ready master file.
         """)
 
-    master_file = st.file_uploader("Upload master Excel file", type=["xlsx"])
+    master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="fallen-angels-master")
     st.divider()
 
     sheet_entries = {}
@@ -154,6 +154,61 @@ def main():
             st.dataframe(summary, use_container_width=True)
         except Exception as exc:
             st.error(f"Could not create the file: {exc}")
+
+
+def simple_excel_column_updater():
+    st.header("Simple Excel Column Updater")
+    st.caption("Manual tool for future tasks: upload an Excel file, choose a sheet/column/cell range, and fill one value down the range.")
+    st.info("This is a starter task. Tell me your next exact workflow and I can customize it inside this same app.")
+
+    excel_file = st.file_uploader("Upload Excel file", type=["xlsx"], key="simple-excel-file")
+    sheet_name = st.text_input("Sheet name", value="Sheet1")
+    column_letter = st.text_input("Column letter to update", value="I", max_chars=3)
+    start_row = st.number_input("Start row", min_value=1, value=2, step=1)
+    end_row = st.number_input("End row", min_value=1, value=10, step=1)
+    value = st.text_input("Value to write", value="")
+
+    if st.button("Create updated Excel", disabled=excel_file is None):
+        try:
+            wb = openpyxl.load_workbook(excel_file)
+            if sheet_name not in wb.sheetnames:
+                st.error(f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(wb.sheetnames)}")
+                return
+            ws = wb[sheet_name]
+            for row in range(int(start_row), int(end_row) + 1):
+                ws[f"{column_letter.upper()}{row}"] = value
+            output = io.BytesIO()
+            wb.save(output)
+            output.seek(0)
+            st.success("Updated file is ready.")
+            st.download_button(
+                "Download updated Excel",
+                data=output,
+                file_name="Updated_Excel_File.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as exc:
+            st.error(f"Could not update the file: {exc}")
+
+
+def main():
+    st.title("Niraj Excel Tools")
+    st.caption("One free no-API app for manual and fixed Excel tasks.")
+
+    task = st.sidebar.selectbox(
+        "Choose task",
+        [
+            "Fallen Angels retail updater",
+            "Simple Excel column updater",
+        ],
+    )
+
+    st.sidebar.info("No API key is used. Add more tasks here as your workflows grow.")
+
+    if task == "Fallen Angels retail updater":
+        fallen_angels_processor()
+    elif task == "Simple Excel column updater":
+        simple_excel_column_updater()
 
 
 if __name__ == "__main__":
