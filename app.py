@@ -4,12 +4,18 @@ import re
 import zipfile
 from copy import copy
 
+import numpy as np
 import openpyxl
 import pytesseract
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from pdf2image import convert_from_bytes
 from pillow_heif import register_heif_opener
+
+try:
+    from paddleocr import PaddleOCR
+except Exception:
+    PaddleOCR = None
 
 register_heif_opener()
 
@@ -156,12 +162,47 @@ def images_from_upload(uploaded_file):
     return [image]
 
 
-def extract_text_from_invoice(uploaded_file):
+def preprocess_for_ocr(image):
+    image = image.convert("L")
+    image = ImageEnhance.Contrast(image).enhance(2.0)
+    image = ImageEnhance.Sharpness(image).enhance(2.0)
+    image = image.filter(ImageFilter.SHARPEN)
+    return image.convert("RGB")
+
+
+@st.cache_resource(show_spinner=False)
+def get_paddle_ocr():
+    if PaddleOCR is None:
+        return None
+    return PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+
+
+def extract_text_with_paddle(image):
+    ocr = get_paddle_ocr()
+    if ocr is None:
+        raise RuntimeError("PaddleOCR is not installed or failed to load.")
+
+    image_array = np.array(image.convert("RGB"))
+    result = ocr.ocr(image_array, cls=True)
+    lines = []
+    for page in result or []:
+        for item in page or []:
+            if len(item) >= 2 and len(item[1]) >= 1:
+                text = item[1][0]
+                confidence = item[1][1] if len(item[1]) > 1 else 0
+                lines.append(f"{text}  [conf:{confidence:.2f}]")
+    return "\n".join(lines)
+
+
+def extract_text_from_invoice(uploaded_file, engine="Tesseract"):
     pages = images_from_upload(uploaded_file)
     text_parts = []
     for page in pages:
-        image = page.convert("RGB")
-        text = pytesseract.image_to_string(image, config="--psm 6")
+        image = preprocess_for_ocr(page)
+        if engine == "PaddleOCR":
+            text = extract_text_with_paddle(image)
+        else:
+            text = pytesseract.image_to_string(image, config="--psm 6")
         text_parts.append(text)
     return "\n".join(text_parts)
 
@@ -211,8 +252,16 @@ def extract_entries_from_text(text):
 
 def automated_ocr_processor():
     st.header("Automated Invoice OCR to Excel")
-    #st.caption("Free OCR version: upload master Excel + invoice images/PDFs, then download the filled Excel file. No AI API key needed.")
-    #st.warning("This uses free OCR, not AI. It works best with clear printed invoices. Handwriting, blurry photos, or unusual layouts may need checking.")
+    st.caption("Free OCR version: upload master Excel + invoice images/PDFs, then download the filled Excel file. No AI API key needed.")
+    st.warning("This uses free OCR, not AI. It works best with clear printed invoices. Handwriting, blurry photos, or unusual layouts may need checking.")
+    ocr_engine = st.radio(
+        "OCR engine",
+        ["PaddleOCR", "Tesseract"],
+        index=0,
+        help="PaddleOCR may work better for table photos, but it is slower and heavier. Tesseract is lighter but weaker for handwriting.",
+    )
+    if ocr_engine == "PaddleOCR" and PaddleOCR is None:
+        st.error("PaddleOCR is not available. Check requirements.txt and Streamlit build logs, or switch to Tesseract.")
 
     master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="ocr-master")
     invoice_files = st.file_uploader(
@@ -232,7 +281,7 @@ def automated_ocr_processor():
         with st.spinner("Reading invoices with OCR..."):
             for invoice in invoice_files:
                 show_name = detect_show_from_filename(invoice.name)
-                text = extract_text_from_invoice(invoice)
+                text = extract_text_from_invoice(invoice, engine=ocr_engine)
                 entries = extract_entries_from_text(text)
                 if show_name:
                     sheet_entries[show_name] = entries
