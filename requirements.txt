@@ -4,3 +4,6 @@ Pillow
 pillow-heif
 pytesseract
 pdf2image
+numpy
+paddleocr
+paddlepaddle
