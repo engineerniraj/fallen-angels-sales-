@@ -1,10 +1,13 @@
 import io
+import re
 import zipfile
 from copy import copy
 
 import openpyxl
+import pytesseract
 import streamlit as st
 from PIL import Image
+from pdf2image import convert_from_bytes
 from pillow_heif import register_heif_opener
 
 register_heif_opener()
@@ -108,6 +111,119 @@ def build_download(master_file, sheet_entries):
     workbook.save(output)
     output.seek(0)
     return output, summary
+
+
+def images_from_upload(uploaded_file):
+    file_bytes = uploaded_file.getvalue()
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        return convert_from_bytes(file_bytes, dpi=220)
+    image = Image.open(io.BytesIO(file_bytes))
+    return [image]
+
+
+def extract_text_from_invoice(uploaded_file):
+    pages = images_from_upload(uploaded_file)
+    text_parts = []
+    for page in pages:
+        image = page.convert("RGB")
+        text = pytesseract.image_to_string(image, config="--psm 6")
+        text_parts.append(text)
+    return "\n".join(text_parts)
+
+
+def detect_show_from_filename(filename):
+    name = filename.lower()
+    if "tuesday" in name:
+        return "Tuesday"
+    if "wednesday" in name and ("2" in name or "2pm" in name or "2 pm" in name):
+        return "Wednesday 2 PM"
+    if "wednesday" in name and ("8" in name or "8pm" in name or "8 pm" in name):
+        return "Wednesday 8 PM"
+    if "thursday" in name:
+        return "Thursday"
+    if "friday" in name:
+        return "Friday"
+    if "saturday" in name and ("2" in name or "2pm" in name or "2 pm" in name):
+        return "Saturday 2 PM"
+    if "saturday" in name and ("8" in name or "8pm" in name or "8 pm" in name):
+        return "Saturday 8 PM"
+    if "sunday" in name:
+        return "Sunday"
+    return None
+
+
+def parse_qty_from_line(line):
+    numbers = [int(match) for match in re.findall(r"\b\d+\b", line)]
+    if len(numbers) >= 2:
+        return max(numbers[0] - numbers[1], 0)
+    if len(numbers) == 1:
+        return numbers[0]
+    return 0
+
+
+def extract_entries_from_text(text):
+    entries = {product["label"]: 0 for product in PRODUCTS}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        lowered = normalize(line)
+        for product in PRODUCTS:
+            if any(keyword.strip() and keyword.strip() in lowered for keyword in product["keywords"]):
+                qty = parse_qty_from_line(line)
+                if qty:
+                    entries[product["label"]] += qty
+    return entries
+
+
+def automated_ocr_processor():
+    st.header("Automated Invoice OCR to Excel")
+    st.caption("Free OCR version: upload master Excel + invoice images/PDFs, then download the filled Excel file. No AI API key needed.")
+    st.warning("This uses free OCR, not AI. It works best with clear printed invoices. Handwriting, blurry photos, or unusual layouts may need checking.")
+
+    master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="ocr-master")
+    invoice_files = st.file_uploader(
+        "Upload invoice images/PDFs",
+        type=["jpg", "jpeg", "png", "heic", "heif", "pdf"],
+        accept_multiple_files=True,
+        key="ocr-invoices",
+    )
+
+    if not master_file or not invoice_files:
+        st.info("Upload the master Excel file and all invoice files to begin.")
+        return
+
+    if st.button("Extract invoices and create Excel", type="primary"):
+        sheet_entries = {show: {product["label"]: 0 for product in PRODUCTS} for show in SHOWS}
+        extracted_rows = []
+        with st.spinner("Reading invoices with OCR..."):
+            for invoice in invoice_files:
+                show_name = detect_show_from_filename(invoice.name)
+                text = extract_text_from_invoice(invoice)
+                entries = extract_entries_from_text(text)
+                if show_name:
+                    sheet_entries[show_name] = entries
+                extracted_rows.append({
+                    "file": invoice.name,
+                    "detected_show": show_name or "Not detected from filename",
+                    "extracted_text_preview": text[:800],
+                    "entries": {k: v for k, v in entries.items() if v},
+                })
+
+        try:
+            output, summary = build_download(master_file, sheet_entries)
+            st.success("OCR complete. Download your completed master file below.")
+            st.download_button(
+                "Download completed Excel file",
+                data=output,
+                file_name="Fallen_Angels_Mastersheet_OCR_Completed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.subheader("Detected invoice data")
+            st.dataframe(extracted_rows, use_container_width=True)
+            st.subheader("Excel update summary")
+            st.dataframe(summary, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not create the Excel file: {exc}")
 
 
 def fallen_angels_processor():
@@ -261,15 +377,18 @@ def main():
     task = st.sidebar.selectbox(
         "Choose task",
         [
+            "Automated invoice OCR to Excel",
             "Fallen Angels retail updater",
             "Simple Excel column updater",
             "HEIC to JPG Converter",
         ],
     )
 
-    st.sidebar.info("No API key is used. Add more tasks here as your workflows grow.")
+    st.sidebar.info("No paid AI API key is used. Automated OCR is free but may need checking for messy invoices.")
 
-    if task == "Fallen Angels retail updater":
+    if task == "Automated invoice OCR to Excel":
+        automated_ocr_processor()
+    elif task == "Fallen Angels retail updater":
         fallen_angels_processor()
     elif task == "Simple Excel column updater":
         simple_excel_column_updater()
