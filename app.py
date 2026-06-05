@@ -211,8 +211,8 @@ def extract_entries_from_text(text):
 
 def automated_ocr_processor():
     st.header("Automated Invoice OCR to Excel")
-    st.caption("Free OCR version: upload master Excel + invoice images/PDFs, then download the filled Excel file. No AI API key needed.")
-    st.warning("This uses free OCR, not AI. It works best with clear printed invoices. Handwriting, blurry photos, or unusual layouts may need checking.")
+    #st.caption("Free OCR version: upload master Excel + invoice images/PDFs, then download the filled Excel file. No AI API key needed.")
+    #st.warning("This uses free OCR, not AI. It works best with clear printed invoices. Handwriting, blurry photos, or unusual layouts may need checking.")
 
     master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="ocr-master")
     invoice_files = st.file_uploader(
