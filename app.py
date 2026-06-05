@@ -1,3 +1,4 @@
+import hmac
 import io
 import re
 import zipfile
@@ -13,6 +14,39 @@ from pillow_heif import register_heif_opener
 register_heif_opener()
 
 st.set_page_config(page_title="Niraj Excel Tools", page_icon="📊", layout="wide")
+
+
+def check_password():
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("Niraj Excel Tools")
+    st.subheader("Login required")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login", type="primary"):
+        valid_username = st.secrets.get("APP_USERNAME", "")
+        valid_password = st.secrets.get("APP_PASSWORD", "")
+
+        username_ok = hmac.compare_digest(username, valid_username)
+        password_ok = hmac.compare_digest(password, valid_password)
+
+        if username_ok and password_ok:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect username or password")
+
+    return False
+
+
+def logout_button():
+    with st.sidebar:
+        if st.button("Logout"):
+            st.session_state["authenticated"] = False
+            st.rerun()
+
 
 COLUMN_I = 9
 
@@ -371,6 +405,10 @@ def heic_to_jpg_converter():
 
 
 def main():
+    if not check_password():
+        return
+
+    logout_button()
     st.title("Niraj Excel Tools")
     st.caption("One free no-API app for manual and fixed Excel tasks.")
 
