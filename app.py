@@ -1,242 +1,475 @@
-import streamlit as st
-import google.generativeai as genai
-from PIL import Image
-import pandas as pd
-import json
+import hmac
 import io
-import os
-from dotenv import load_dotenv
+import re
+import zipfile
+from copy import copy
 
-load_dotenv()
+import google.generativeai as genai
+import openpyxl
+import streamlit as st
+from PIL import Image
+from pdf2image import convert_from_bytes
+from pillow_heif import register_heif_opener
 
-st.set_page_config(
-    page_title="Handwritten Invoice Extractor",
-    page_icon="🧾",
-    layout="wide"
-)
+register_heif_opener()
 
-st.title("Handwritten Invoice Data Extractor")
-st.write("Upload invoice images and extract structured data using Gemini API.")
-
-
-def get_api_key():
-    try:
-        return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        return os.getenv("GEMINI_API_KEY")
+st.set_page_config(page_title="Niraj Excel Tools", page_icon="📊", layout="wide")
 
 
-api_key = get_api_key()
+def check_password():
+    if st.session_state.get("authenticated"):
+        return True
+    st.title("Niraj Excel Tools")
+    st.subheader("Login required")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Login", type="primary"):
+        valid_username = st.secrets.get("APP_USERNAME", "")
+        valid_password = st.secrets.get("APP_PASSWORD", "")
+        username_ok = hmac.compare_digest(username, valid_username)
+        password_ok = hmac.compare_digest(password, valid_password)
+        if username_ok and password_ok:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect username or password")
+    return False
 
-if not api_key:
-    st.error("GEMINI_API_KEY is missing. Add it in Streamlit Secrets or your local .env file.")
-    st.stop()
 
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel("gemini-2.5-flash")
+def logout_button():
+    with st.sidebar:
+        if st.button("Logout"):
+            st.session_state["authenticated"] = False
+            st.rerun()
 
 
-EXTRACTION_PROMPT = """
-You are an expert invoice data extraction system.
+COLUMN_I = 9
+SHOWS = [
+    "Tuesday",
+    "Wednesday 2 PM",
+    "Wednesday 8 PM",
+    "Thursday",
+    "Friday",
+    "Saturday 2 PM",
+    "Saturday 8 PM",
+    "Sunday",
+]
+PRODUCTS = [
+    {"label": "Poster", "keywords": ["poster"]},
+    {"label": "Magnet", "keywords": ["magnet"]},
+    {"label": "Lapel Pin", "keywords": ["lapel", "pin"]},
+    {"label": "Keychain", "keywords": ["keychain", "key chain"]},
+    {"label": "Mug", "keywords": ["mug"]},
+    {"label": "Tote", "keywords": ["tote"]},
+    {"label": "Logo Tee S", "keywords": ["logo", "small", " s"]},
+    {"label": "Logo Tee M", "keywords": ["logo", "medium", " m"]},
+    {"label": "Logo Tee L", "keywords": ["logo", "large", " l"]},
+    {"label": "Logo Tee XL", "keywords": ["logo", "xl"]},
+    {"label": "Lapse Tee S", "keywords": ["lapse", "small", " s"]},
+    {"label": "Lapse Tee M", "keywords": ["lapse", "medium", " m"]},
+    {"label": "Lapse Tee L", "keywords": ["lapse", "large", " l"]},
+    {"label": "Lapse Tee XL", "keywords": ["lapse", "xl"]},
+    {"label": "Lapse Tee XXL", "keywords": ["lapse", "xxl", "2xl"]},
+    {"label": "Hoodie S", "keywords": ["hoodie", "small", " s"]},
+    {"label": "Hoodie M", "keywords": ["hoodie", "medium", " m"]},
+    {"label": "Hoodie L", "keywords": ["hoodie", "large", " l"]},
+    {"label": "Hoodie XL", "keywords": ["hoodie", "xl"]},
+]
 
-Extract data from the invoice image, including handwritten and printed text.
-Return only valid JSON. Do not include markdown, explanations, or extra text.
 
-Use this exact JSON structure:
-{
-  "invoice_number": null,
-  "invoice_date": null,
-  "vendor_name": null,
-  "vendor_address": null,
-  "customer_name": null,
-  "customer_address": null,
-  "subtotal": null,
-  "tax_amount": null,
-  "discount": null,
-  "total_amount": null,
-  "currency": null,
-  "payment_status": null,
-  "line_items": [
-    {
-      "description": null,
-      "quantity": null,
-      "unit_price": null,
-      "amount": null
-    }
-  ],
-  "notes": null
-}
+def normalize(value):
+    return str(value or "").strip().lower()
+
+
+def find_product_row(ws, product):
+    keywords = product["keywords"]
+    best_row = None
+    best_score = 0
+    for row in range(1, ws.max_row + 1):
+        text = " ".join(normalize(ws.cell(row=row, column=col).value) for col in range(1, 9))
+        if not text:
+            continue
+        score = sum(1 for keyword in keywords if keyword in text)
+        if score > best_score:
+            best_score = score
+            best_row = row
+    return best_row if best_score else None
+
+
+def copy_cell_style(source, target):
+    if source.has_style:
+        target.font = copy(source.font)
+        target.fill = copy(source.fill)
+        target.border = copy(source.border)
+        target.alignment = copy(source.alignment)
+        target.number_format = source.number_format
+        target.protection = copy(source.protection)
+
+
+def write_retail_values(workbook, sheet_entries):
+    summary = []
+    for index, show_name in enumerate(SHOWS):
+        if index >= len(workbook.worksheets):
+            continue
+        ws = workbook.worksheets[index]
+        entries = sheet_entries.get(show_name, {})
+        entered_count = 0
+        missing = []
+        for product in PRODUCTS:
+            qty = int(entries.get(product["label"], 0) or 0)
+            if qty == 0:
+                continue
+            row = find_product_row(ws, product)
+            if row:
+                cell = ws.cell(row=row, column=COLUMN_I)
+                copy_cell_style(ws.cell(row=row, column=COLUMN_I + 1), cell)
+                cell.value = qty
+                entered_count += 1
+            else:
+                missing.append(product["label"])
+        summary.append({"show": show_name, "worksheet": ws.title, "items": entered_count, "missing": missing})
+    return summary
+
+
+def build_download(master_file, sheet_entries):
+    workbook = openpyxl.load_workbook(master_file)
+    summary = write_retail_values(workbook, sheet_entries)
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output, summary
+
+
+def images_from_upload(uploaded_file):
+    file_bytes = uploaded_file.getvalue()
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        return convert_from_bytes(file_bytes, dpi=220)
+    image = Image.open(io.BytesIO(file_bytes))
+    return [image]
+
+
+def get_gemini_model():
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is missing. Add it in Streamlit Secrets.")
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel("gemini-2.5-flash")
+
+
+def build_gemini_invoice_prompt():
+    product_list = "\n".join(f"- {product['label']}" for product in PRODUCTS)
+    return f"""
+You are reading a merchandise sales invoice image.
+Extract the retail quantity sold for each product below.
+
+Products:
+{product_list}
+
+Return only plain text in this exact format:
+Poster: 0
+Magnet: 0
+Lapel Pin: 0
+Keychain: 0
+Mug: 0
+Tote: 0
+Logo Tee S: 0
+Logo Tee M: 0
+Logo Tee L: 0
+Logo Tee XL: 0
+Lapse Tee S: 0
+Lapse Tee M: 0
+Lapse Tee L: 0
+Lapse Tee XL: 0
+Lapse Tee XXL: 0
+Hoodie S: 0
+Hoodie M: 0
+Hoodie L: 0
+Hoodie XL: 0
 
 Rules:
-- If a value is unreadable or missing, use null.
-- Keep amounts as numbers when possible.
+- Read printed and handwritten text.
+- If the invoice has starting quantity and ending quantity, sold quantity = starting quantity minus ending quantity.
+- If the invoice directly shows retail/sold quantity, use that quantity.
+- If a product is missing, blank, or unreadable, return 0.
 - Do not guess unclear handwriting.
-- For dates, use the format found on the invoice if uncertain.
-- Include all visible line items.
+- Do not include markdown, JSON, explanations, or extra text.
 """
 
 
-def clean_json_response(text):
-    text = text.strip()
-    text = text.replace("```json", "").replace("```", "").strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start != -1 and end != -1:
-        text = text[start:end + 1]
-
-    return text
-
-
-def extract_invoice_data(uploaded_file):
-    image = Image.open(uploaded_file).convert("RGB")
-
-    response = model.generate_content([EXTRACTION_PROMPT, image])
-    raw_text = response.text
-    cleaned_text = clean_json_response(raw_text)
-
-    try:
-        data = json.loads(cleaned_text)
-        return data, raw_text, None
-    except json.JSONDecodeError as error:
-        return None, raw_text, str(error)
+def extract_text_from_invoice(uploaded_file):
+    pages = images_from_upload(uploaded_file)
+    text_parts = []
+    model = get_gemini_model()
+    prompt = build_gemini_invoice_prompt()
+    for page in pages:
+        image = page.convert("RGB")
+        response = model.generate_content([prompt, image])
+        text_parts.append(response.text or "")
+    return "\n".join(text_parts)
 
 
-def flatten_invoice_data(filename, data):
-    line_items = data.get("line_items") or []
-
-    if not line_items:
-        line_items = [{
-            "description": None,
-            "quantity": None,
-            "unit_price": None,
-            "amount": None
-        }]
-
-    rows = []
-    for item in line_items:
-        rows.append({
-            "file_name": filename,
-            "invoice_number": data.get("invoice_number"),
-            "invoice_date": data.get("invoice_date"),
-            "vendor_name": data.get("vendor_name"),
-            "vendor_address": data.get("vendor_address"),
-            "customer_name": data.get("customer_name"),
-            "customer_address": data.get("customer_address"),
-            "subtotal": data.get("subtotal"),
-            "tax_amount": data.get("tax_amount"),
-            "discount": data.get("discount"),
-            "total_amount": data.get("total_amount"),
-            "currency": data.get("currency"),
-            "payment_status": data.get("payment_status"),
-            "item_description": item.get("description"),
-            "item_quantity": item.get("quantity"),
-            "item_unit_price": item.get("unit_price"),
-            "item_amount": item.get("amount"),
-            "notes": data.get("notes")
-        })
-
-    return rows
+def detect_show_from_filename(filename):
+    name = filename.lower()
+    if "tuesday" in name:
+        return "Tuesday"
+    if "wednesday" in name and ("2" in name or "2pm" in name or "2 pm" in name):
+        return "Wednesday 2 PM"
+    if "wednesday" in name and ("8" in name or "8pm" in name or "8 pm" in name):
+        return "Wednesday 8 PM"
+    if "thursday" in name:
+        return "Thursday"
+    if "friday" in name:
+        return "Friday"
+    if "saturday" in name and ("2" in name or "2pm" in name or "2 pm" in name):
+        return "Saturday 2 PM"
+    if "saturday" in name and ("8" in name or "8pm" in name or "8 pm" in name):
+        return "Saturday 8 PM"
+    if "sunday" in name:
+        return "Sunday"
+    return None
 
 
-def dataframe_to_excel(df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Extracted Invoices")
-    output.seek(0)
-    return output
+def parse_qty_from_line(line):
+    numbers = [int(match) for match in re.findall(r"\b\d+\b", line)]
+    if len(numbers) >= 2:
+        return max(numbers[0] - numbers[1], 0)
+    if len(numbers) == 1:
+        return numbers[0]
+    return 0
 
 
-uploaded_files = st.file_uploader(
-    "Upload invoice image files",
-    type=["jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True
-)
+def extract_entries_from_text(text):
+    entries = {product["label"]: 0 for product in PRODUCTS}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        lowered = normalize(line)
+        for product in PRODUCTS:
+            product_label = normalize(product["label"])
+            if product_label in lowered or any(keyword.strip() and keyword.strip() in lowered for keyword in product["keywords"]):
+                qty = parse_qty_from_line(line)
+                entries[product["label"]] = qty
+                break
+    return entries
 
-if uploaded_files:
-    all_rows = []
-    extracted_json = {}
-    failed_files = []
 
-    if st.button("Extract Invoice Data"):
-        progress_bar = st.progress(0)
+def automated_ocr_processor():
+    st.header("Automated Invoice OCR to Excel")
+    st.caption("Gemini AI version: upload master Excel + invoice images/PDFs, then download the filled Excel file.")
+    st.warning("This uses Gemini API for better printed and handwritten invoice reading. Please check the detected values before using the final Excel file.")
 
-        for index, uploaded_file in enumerate(uploaded_files):
-            st.subheader(f"Processing: {uploaded_file.name}")
+    if not st.secrets.get("GEMINI_API_KEY", ""):
+        st.error("GEMINI_API_KEY is missing. Add it in Streamlit Secrets before using this tool.")
+        st.code('GEMINI_API_KEY = "your_api_key_here"', language="toml")
+        return
 
-            col1, col2 = st.columns([1, 2])
-
-            with col1:
-                image = Image.open(uploaded_file).convert("RGB")
-                st.image(image, caption=uploaded_file.name, use_container_width=True)
-
-            with col2:
+    master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="ocr-master")
+    invoice_files = st.file_uploader(
+        "Upload invoice images/PDFs",
+        type=["jpg", "jpeg", "png", "heic", "heif", "pdf"],
+        accept_multiple_files=True,
+        key="ocr-invoices",
+    )
+    if not master_file or not invoice_files:
+        st.info("Upload the master Excel file and all invoice files to begin.")
+        return
+    if st.button("Extract invoices and create Excel", type="primary"):
+        sheet_entries = {show: {product["label"]: 0 for product in PRODUCTS} for show in SHOWS}
+        extracted_rows = []
+        with st.spinner("Reading invoices with Gemini AI..."):
+            for invoice in invoice_files:
                 try:
-                    uploaded_file.seek(0)
-                    data, raw_text, error = extract_invoice_data(uploaded_file)
+                    show_name = detect_show_from_filename(invoice.name)
+                    text = extract_text_from_invoice(invoice)
+                    entries = extract_entries_from_text(text)
+                    if show_name:
+                        sheet_entries[show_name] = entries
+                    extracted_rows.append({
+                        "file": invoice.name,
+                        "detected_show": show_name or "Not detected from filename",
+                        "extracted_text_preview": text[:800],
+                        "entries": {k: v for k, v in entries.items() if v},
+                    })
+                except Exception as exc:
+                    st.error(f"Could not extract {invoice.name}: {exc}")
+                    extracted_rows.append({
+                        "file": invoice.name,
+                        "detected_show": "Error",
+                        "extracted_text_preview": str(exc),
+                        "entries": {},
+                    })
+        try:
+            output, summary = build_download(master_file, sheet_entries)
+            st.success("Gemini extraction complete. Download your completed master file below.")
+            st.download_button(
+                "Download completed Excel file",
+                data=output,
+                file_name="Fallen_Angels_Mastersheet_Gemini_Completed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.subheader("Detected invoice data")
+            st.dataframe(extracted_rows, use_container_width=True)
+            st.subheader("Excel update summary")
+            st.dataframe(summary, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not create the Excel file: {exc}")
 
-                    if error:
-                        st.error(f"Could not parse JSON for {uploaded_file.name}: {error}")
-                        st.text_area("Raw Gemini Output", raw_text, height=220)
-                        failed_files.append(uploaded_file.name)
-                    else:
-                        st.success("Extraction completed")
-                        st.json(data)
-                        extracted_json[uploaded_file.name] = data
-                        all_rows.extend(flatten_invoice_data(uploaded_file.name, data))
 
-                except Exception as error:
-                    st.error(f"Could not extract {uploaded_file.name}: {error}")
-                    failed_files.append(uploaded_file.name)
+def fallen_angels_processor():
+    st.header("Fallen Angels Sales Report Processor")
+    st.caption("No API key needed. Staff enter the retail quantities from each invoice, then download the finished Excel file.")
+    with st.expander("How to use", expanded=True):
+        st.markdown("""
+        1. Upload the master Excel file.
+        2. For each show, type the **RETAIL quantity sold** from the invoice.
+        3. Click **Create completed Excel file**.
+        4. Download the ready master file.
+        """)
+    master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="fallen-angels-master")
+    st.divider()
+    sheet_entries = {}
+    tabs = st.tabs(SHOWS)
+    for show_name, tab in zip(SHOWS, tabs):
+        with tab:
+            st.subheader(show_name)
+            cols = st.columns(3)
+            values = {}
+            for idx, product in enumerate(PRODUCTS):
+                with cols[idx % 3]:
+                    values[product["label"]] = st.number_input(
+                        product["label"],
+                        min_value=0,
+                        max_value=999,
+                        value=0,
+                        step=1,
+                        key=f"{show_name}-{product['label']}",
+                    )
+            sheet_entries[show_name] = values
+    st.divider()
+    if st.button("Create completed Excel file", type="primary", disabled=master_file is None):
+        try:
+            output, summary = build_download(master_file, sheet_entries)
+            st.success("Done. Download your completed master file below.")
+            st.download_button(
+                "Download completed Excel file",
+                data=output,
+                file_name="Fallen_Angels_Mastersheet_Completed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.write("Update summary")
+            st.dataframe(summary, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not create the file: {exc}")
 
-            progress_bar.progress((index + 1) / len(uploaded_files))
 
-        if all_rows:
-            st.divider()
-            st.header("Extracted Data Table")
+def simple_excel_column_updater():
+    st.header("Simple Excel Column Updater")
+    st.caption("Manual tool for future tasks: upload an Excel file, choose a sheet/column/cell range, and fill one value down the range.")
+    st.info("This is a starter task. Tell me your next exact workflow and I can customize it inside this same app.")
+    excel_file = st.file_uploader("Upload Excel file", type=["xlsx"], key="simple-excel-file")
+    sheet_name = st.text_input("Sheet name", value="Sheet1")
+    column_letter = st.text_input("Column letter to update", value="I", max_chars=3)
+    start_row = st.number_input("Start row", min_value=1, value=2, step=1)
+    end_row = st.number_input("End row", min_value=1, value=10, step=1)
+    value = st.text_input("Value to write", value="")
+    if st.button("Create updated Excel", disabled=excel_file is None):
+        try:
+            wb = openpyxl.load_workbook(excel_file)
+            if sheet_name not in wb.sheetnames:
+                st.error(f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(wb.sheetnames)}")
+                return
+            ws = wb[sheet_name]
+            for row in range(int(start_row), int(end_row) + 1):
+                ws[f"{column_letter.upper()}{row}"] = value
+            output = io.BytesIO()
+            wb.save(output)
+            output.seek(0)
+            st.success("Updated file is ready.")
+            st.download_button(
+                "Download updated Excel",
+                data=output,
+                file_name="Updated_Excel_File.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as exc:
+            st.error(f"Could not update the file: {exc}")
 
-            df = pd.DataFrame(all_rows)
-            edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
-            csv_data = edited_df.to_csv(index=False).encode("utf-8")
-            excel_data = dataframe_to_excel(edited_df)
-            json_data = json.dumps(extracted_json, indent=2).encode("utf-8")
+def heic_to_jpg_converter():
+    st.header("HEIC to JPG Converter")
+    st.caption("Convert iPhone HEIC/HEIF photos to JPG. No API key needed; conversion happens inside the Streamlit app.")
+    uploaded_files = st.file_uploader(
+        "Upload HEIC/HEIF images",
+        type=["heic", "heif"],
+        accept_multiple_files=True,
+        key="heic-files",
+    )
+    quality = st.slider("JPG quality", min_value=60, max_value=100, value=90, step=5)
+    if not uploaded_files:
+        st.info("Upload one or more .heic or .heif files to convert them into JPG.")
+        return
+    converted_files = []
+    for uploaded_file in uploaded_files:
+        try:
+            image = Image.open(uploaded_file)
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=quality, optimize=True)
+            output.seek(0)
+            base_name = uploaded_file.name.rsplit(".", 1)[0]
+            jpg_name = f"{base_name}.jpg"
+            converted_files.append((jpg_name, output.getvalue()))
+            st.success(f"Converted: {uploaded_file.name} → {jpg_name}")
+            st.image(output.getvalue(), caption=jpg_name, use_container_width=True)
+            st.download_button(
+                f"Download {jpg_name}",
+                data=output.getvalue(),
+                file_name=jpg_name,
+                mime="image/jpeg",
+                key=f"download-{jpg_name}",
+            )
+        except Exception as exc:
+            st.error(f"Could not convert {uploaded_file.name}: {exc}")
+    if len(converted_files) > 1:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_name, file_bytes in converted_files:
+                zip_file.writestr(file_name, file_bytes)
+        zip_buffer.seek(0)
+        st.download_button(
+            "Download all JPG files as ZIP",
+            data=zip_buffer,
+            file_name="converted_jpg_files.zip",
+            mime="application/zip",
+        )
 
-            col_csv, col_excel, col_json = st.columns(3)
 
-            with col_csv:
-                st.download_button(
-                    "Download CSV",
-                    data=csv_data,
-                    file_name="extracted_invoices.csv",
-                    mime="text/csv"
-                )
+def main():
+    if not check_password():
+        return
+    logout_button()
+    st.title("Niraj Excel Tools")
+    st.caption("One app for manual Excel tasks, HEIC conversion, and Gemini invoice extraction.")
+    task = st.sidebar.selectbox(
+        "Choose task",
+        [
+            "Automated invoice OCR to Excel",
+            "Fallen Angels retail updater",
+            "Simple Excel column updater",
+            "HEIC to JPG Converter",
+        ],
+    )
+    st.sidebar.info("Automated OCR uses Gemini API. Manual updater and HEIC converter do not need AI.")
+    if task == "Automated invoice OCR to Excel":
+        automated_ocr_processor()
+    elif task == "Fallen Angels retail updater":
+        fallen_angels_processor()
+    elif task == "Simple Excel column updater":
+        simple_excel_column_updater()
+    elif task == "HEIC to JPG Converter":
+        heic_to_jpg_converter()
 
-            with col_excel:
-                st.download_button(
-                    "Download Excel",
-                    data=excel_data,
-                    file_name="extracted_invoices.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
 
-            with col_json:
-                st.download_button(
-                    "Download JSON",
-                    data=json_data,
-                    file_name="extracted_invoices.json",
-                    mime="application/json"
-                )
-
-        if failed_files:
-            st.warning("Some files could not be processed:")
-            for failed_file in failed_files:
-                st.write(f"- {failed_file}")
-else:
-    st.info("Upload one or more invoice images to begin.")
-
-st.sidebar.header("Setup")
-st.sidebar.write("Required Streamlit secret:")
-st.sidebar.code('GEMINI_API_KEY = "your_api_key_here"', language="toml")
-st.sidebar.write("Current model: gemini-2.5-flash")
+if __name__ == "__main__":
+    main()
