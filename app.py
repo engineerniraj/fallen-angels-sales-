@@ -1,16 +1,23 @@
 import hmac
 import io
+import json
 import re
 import zipfile
 from copy import copy
 
 import numpy as np
 import openpyxl
+import pandas as pd
 import pytesseract
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter
 from pdf2image import convert_from_bytes
 from pillow_heif import register_heif_opener
+
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
 
 try:
     from paddleocr import PaddleOCR
@@ -207,6 +214,54 @@ def extract_text_from_invoice(uploaded_file, engine="Tesseract"):
     return "\n".join(text_parts)
 
 
+def get_gemini_model():
+    if genai is None:
+        raise RuntimeError("Google Gemini SDK is not installed. Add google-generativeai to requirements.txt.")
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing from Streamlit Secrets.")
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel("gemini-1.5-flash")
+
+
+def extract_json_from_response(text):
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```json\s*", "", cleaned)
+    cleaned = re.sub(r"^```\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(0)
+    return json.loads(cleaned)
+
+
+def extract_entries_with_gemini(uploaded_file):
+    model = get_gemini_model()
+    pages = images_from_upload(uploaded_file)
+    image = pages[0].convert("RGB")
+
+    prompt = f"""
+You are extracting data from a Fallen Angels sales sheet photo.
+Focus ONLY on the right-side handwritten RETAIL quantity column, immediately after the PROMO column and before the STAFF column.
+Do not extract PRE, ADD, START, END, PROMO, STAFF, $ RETAIL, $ STAFF, prices, or totals.
+Return only valid JSON. No markdown.
+
+Products/sizes to return exactly:
+{json.dumps([product["label"] for product in PRODUCTS])}
+
+Rules:
+- Use 0 when a product's right-side RETAIL quantity cell is blank or unreadable.
+- If a quantity is faint but likely readable, return the best integer.
+- Do not calculate from dollar amounts unless the RETAIL quantity cell is blank and the dollar amount clearly belongs to the same row.
+- Return this exact structure:
+{{"entries": {{"Poster": 0, "Magnet": 0}}, "notes": "short explanation"}}
+"""
+    response = model.generate_content([prompt, image])
+    data = extract_json_from_response(response.text)
+    entries = {product["label"]: int(data.get("entries", {}).get(product["label"], 0) or 0) for product in PRODUCTS}
+    return entries, data.get("notes", "")
+
+
 def detect_show_from_filename(filename):
     name = filename.lower()
     if "tuesday" in name:
@@ -251,58 +306,80 @@ def extract_entries_from_text(text):
 
 
 def automated_ocr_processor():
-    st.header("Automated Invoice OCR to Excel")
-    st.caption("Free OCR version: upload master Excel + invoice images/PDFs, then download the filled Excel file. No AI API key needed.")
-    st.warning("This uses free OCR, not AI. It works best with clear printed invoices. Handwriting, blurry photos, or unusual layouts may need checking.")
-    ocr_engine = st.radio(
-        "OCR engine",
-        ["PaddleOCR", "Tesseract"],
-        index=0,
-        help="PaddleOCR may work better for table photos, but it is slower and heavier. Tesseract is lighter but weaker for handwriting.",
-    )
-    if ocr_engine == "PaddleOCR" and PaddleOCR is None:
-        st.error("PaddleOCR is not available. Check requirements.txt and Streamlit build logs, or switch to Tesseract.")
+    st.header("Gemini Invoice Extraction to Excel")
+    st.caption("Upload handwritten invoice photos and a master Excel file. Gemini reads the right-side RETAIL quantity column, then you review before export.")
+    st.warning("Review the table before downloading. Handwritten pencil values can still be misread, so the app will not write directly without your confirmation.")
 
-    master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="ocr-master")
+    if genai is None:
+        st.error("Google Gemini SDK is not installed. Update requirements.txt with google-generativeai.")
+        return
+    if not st.secrets.get("GEMINI_API_KEY", ""):
+        st.error("GEMINI_API_KEY is missing. Add it in Streamlit Secrets, then reboot the app.")
+        return
+
+    master_file = st.file_uploader("Upload master Excel file", type=["xlsx"], key="gemini-master")
     invoice_files = st.file_uploader(
         "Upload invoice images/PDFs",
         type=["jpg", "jpeg", "png", "heic", "heif", "pdf"],
         accept_multiple_files=True,
-        key="ocr-invoices",
+        key="gemini-invoices",
     )
 
     if not master_file or not invoice_files:
-        st.info("Upload the master Excel file and all invoice files to begin.")
+        st.info("Upload the master Excel file and invoice files to begin.")
         return
 
-    if st.button("Extract invoices and create Excel", type="primary"):
-        sheet_entries = {show: {product["label"]: 0 for product in PRODUCTS} for show in SHOWS}
-        extracted_rows = []
-        with st.spinner("Reading invoices with OCR..."):
+    if st.button("Extract with Gemini", type="primary"):
+        rows = []
+        with st.spinner("Gemini is reading the invoice images..."):
             for invoice in invoice_files:
-                show_name = detect_show_from_filename(invoice.name)
-                text = extract_text_from_invoice(invoice, engine=ocr_engine)
-                entries = extract_entries_from_text(text)
-                if show_name:
-                    sheet_entries[show_name] = entries
-                extracted_rows.append({
-                    "file": invoice.name,
-                    "detected_show": show_name or "Not detected from filename",
-                    "extracted_text_preview": text[:800],
-                    "entries": {k: v for k, v in entries.items() if v},
-                })
+                show_name = detect_show_from_filename(invoice.name) or SHOWS[0]
+                try:
+                    entries, notes = extract_entries_with_gemini(invoice)
+                except Exception as exc:
+                    st.error(f"Could not extract {invoice.name}: {exc}")
+                    entries = {product["label"]: 0 for product in PRODUCTS}
+                    notes = str(exc)
 
+                row = {"Show": show_name, "File": invoice.name, "Notes": notes}
+                for product in PRODUCTS:
+                    row[product["label"]] = entries.get(product["label"], 0)
+                rows.append(row)
+        st.session_state["gemini_review_rows"] = rows
+
+    review_rows = st.session_state.get("gemini_review_rows", [])
+    if not review_rows:
+        return
+
+    st.subheader("Review and correct extracted quantities")
+    st.caption("Edit any wrong numbers here. Only these reviewed values will be written into Excel column I.")
+    review_df = pd.DataFrame(review_rows)
+    edited_df = st.data_editor(
+        review_df,
+        use_container_width=True,
+        num_rows="fixed",
+        disabled=["File", "Notes"],
+        key="gemini-review-editor",
+    )
+
+    if st.button("Create Excel from reviewed values", type="primary"):
         try:
+            sheet_entries = {show: {product["label"]: 0 for product in PRODUCTS} for show in SHOWS}
+            for _, row in edited_df.iterrows():
+                show_name = row.get("Show", SHOWS[0])
+                if show_name not in sheet_entries:
+                    show_name = SHOWS[0]
+                for product in PRODUCTS:
+                    sheet_entries[show_name][product["label"]] = int(row.get(product["label"], 0) or 0)
+
             output, summary = build_download(master_file, sheet_entries)
-            st.success("OCR complete. Download your completed master file below.")
+            st.success("Done. Download your completed Excel file below.")
             st.download_button(
                 "Download completed Excel file",
                 data=output,
-                file_name="Fallen_Angels_Mastersheet_OCR_Completed.xlsx",
+                file_name="Fallen_Angels_Mastersheet_Gemini_Completed.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.subheader("Detected invoice data")
-            st.dataframe(extracted_rows, use_container_width=True)
             st.subheader("Excel update summary")
             st.dataframe(summary, use_container_width=True)
         except Exception as exc:
@@ -459,21 +536,21 @@ def main():
 
     logout_button()
     st.title("Niraj Excel Tools")
-    st.caption("One free no-API app for manual and fixed Excel tasks.")
+    st.caption("Gemini-powered invoice extraction plus manual Excel tools.")
 
     task = st.sidebar.selectbox(
         "Choose task",
         [
-            "Automated invoice OCR to Excel",
+            "Gemini invoice extraction to Excel",
             "Fallen Angels retail updater",
             "Simple Excel column updater",
             "HEIC to JPG Converter",
         ],
     )
 
-    st.sidebar.info("No paid AI API key is used. Automated OCR is free but may need checking for messy invoices.")
+    st.sidebar.info("Gemini API is used only for the automated invoice extraction task. Review extracted values before export.")
 
-    if task == "Automated invoice OCR to Excel":
+    if task == "Gemini invoice extraction to Excel":
         automated_ocr_processor()
     elif task == "Fallen Angels retail updater":
         fallen_angels_processor()
