@@ -1,9 +1,6 @@
 streamlit
-openpyxl
-Pillow
-pillow-heif
-pytesseract
-pdf2image
-numpy
-pandas
 google-generativeai
+pillow
+pandas
+openpyxl
+python-dotenv
