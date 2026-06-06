@@ -5,3 +5,5 @@ pillow-heif
 pytesseract
 pdf2image
 numpy
+pandas
+google-generativeai
