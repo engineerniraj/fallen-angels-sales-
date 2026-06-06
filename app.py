@@ -161,39 +161,45 @@ def build_gemini_invoice_prompt():
     product_list = "\n".join(f"- {product['label']}" for product in PRODUCTS)
     return f"""
 You are reading a merchandise sales invoice image.
-Extract the retail quantity sold for each product below.
+Extract the RETAIL quantity sold for each product below.
 
 Products:
 {product_list}
 
-Return only plain text in this exact format:
-Poster: 0
-Magnet: 0
-Lapel Pin: 0
-Keychain: 0
-Mug: 0
-Tote: 0
-Logo Tee S: 0
-Logo Tee M: 0
-Logo Tee L: 0
-Logo Tee XL: 0
-Lapse Tee S: 0
-Lapse Tee M: 0
-Lapse Tee L: 0
-Lapse Tee XL: 0
-Lapse Tee XXL: 0
-Hoodie S: 0
-Hoodie M: 0
-Hoodie L: 0
-Hoodie XL: 0
+Return exactly 19 lines using this exact format:
+PRODUCT|QTY
 
-Rules:
-- Read printed and handwritten text.
+Use these exact product names only:
+Poster|0
+Magnet|0
+Lapel Pin|0
+Keychain|0
+Mug|0
+Tote|0
+Logo Tee S|0
+Logo Tee M|0
+Logo Tee L|0
+Logo Tee XL|0
+Lapse Tee S|0
+Lapse Tee M|0
+Lapse Tee L|0
+Lapse Tee XL|0
+Lapse Tee XXL|0
+Hoodie S|0
+Hoodie M|0
+Hoodie L|0
+Hoodie XL|0
+
+Important rules:
+- Do not move a quantity from one product to another product.
+- Match shirt sizes carefully: S, M, L, XL, XXL are different products.
+- Match Logo Tee and Lapse Tee separately. Do not mix them.
+- Match Hoodie separately from tees.
 - If the invoice has starting quantity and ending quantity, sold quantity = starting quantity minus ending quantity.
 - If the invoice directly shows retail/sold quantity, use that quantity.
-- If a product is missing, blank, or unreadable, return 0.
+- If a value is blank, missing, unclear, or unreadable, return 0 for that product.
 - Do not guess unclear handwriting.
-- Do not include markdown, JSON, explanations, or extra text.
+- Do not include markdown, JSON, explanations, headings, or extra text.
 """
 
 
@@ -231,32 +237,70 @@ def detect_show_from_filename(filename):
 
 
 def parse_qty_from_line(line):
-    numbers = [int(match) for match in re.findall(r"\b\d+\b", line)]
-    if len(numbers) >= 2:
-        return max(numbers[0] - numbers[1], 0)
-    if len(numbers) == 1:
-        return numbers[0]
+    if "|" in line:
+        qty_text = line.rsplit("|", 1)[-1]
+    elif ":" in line:
+        qty_text = line.rsplit(":", 1)[-1]
+    else:
+        qty_text = line
+
+    numbers = [int(match) for match in re.findall(r"\b\d+\b", qty_text)]
+    if numbers:
+        return numbers[-1]
     return 0
 
 
 def extract_entries_from_text(text):
     entries = {product["label"]: 0 for product in PRODUCTS}
+    exact_labels = {normalize(product["label"]): product["label"] for product in PRODUCTS}
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+
     for line in lines:
-        lowered = normalize(line)
-        for product in PRODUCTS:
-            product_label = normalize(product["label"])
-            if product_label in lowered or any(keyword.strip() and keyword.strip() in lowered for keyword in product["keywords"]):
-                qty = parse_qty_from_line(line)
-                entries[product["label"]] = qty
-                break
+        if "|" in line:
+            raw_label, raw_qty = line.split("|", 1)
+        elif ":" in line:
+            raw_label, raw_qty = line.split(":", 1)
+        else:
+            continue
+
+        label = exact_labels.get(normalize(raw_label))
+        if not label:
+            continue
+
+        entries[label] = parse_qty_from_line(raw_qty)
+
     return entries
+
+
+def entries_to_review_rows(sheet_entries):
+    rows = []
+    for show_name in SHOWS:
+        entries = sheet_entries.get(show_name, {})
+        row = {"Show": show_name}
+        for product in PRODUCTS:
+            row[product["label"]] = int(entries.get(product["label"], 0) or 0)
+        rows.append(row)
+    return rows
+
+
+def review_rows_to_sheet_entries(rows):
+    sheet_entries = {show: {product["label"]: 0 for product in PRODUCTS} for show in SHOWS}
+    for row in rows:
+        show_name = row.get("Show")
+        if show_name not in sheet_entries:
+            continue
+        for product in PRODUCTS:
+            try:
+                sheet_entries[show_name][product["label"]] = int(row.get(product["label"], 0) or 0)
+            except Exception:
+                sheet_entries[show_name][product["label"]] = 0
+    return sheet_entries
 
 
 def automated_ocr_processor():
     st.header("Automated Invoice OCR to Excel")
-    st.caption("Gemini AI version: upload master Excel + invoice images/PDFs, then download the filled Excel file.")
-    st.warning("This uses Gemini API for better printed and handwritten invoice reading. Please check the detected values before using the final Excel file.")
+    st.caption("Gemini AI version: upload master Excel + invoice images/PDFs, review the extracted values, then download the filled Excel file.")
+    st.warning("Gemini can misread handwriting. Review and correct the table before creating the final Excel file.")
 
     if not st.secrets.get("GEMINI_API_KEY", ""):
         st.error("GEMINI_API_KEY is missing. Add it in Streamlit Secrets before using this tool.")
@@ -270,24 +314,29 @@ def automated_ocr_processor():
         accept_multiple_files=True,
         key="ocr-invoices",
     )
+
     if not master_file or not invoice_files:
         st.info("Upload the master Excel file and all invoice files to begin.")
         return
-    if st.button("Extract invoices and create Excel", type="primary"):
+
+    if st.button("Extract invoices", type="primary"):
         sheet_entries = {show: {product["label"]: 0 for product in PRODUCTS} for show in SHOWS}
         extracted_rows = []
+
         with st.spinner("Reading invoices with Gemini AI..."):
             for invoice in invoice_files:
                 try:
                     show_name = detect_show_from_filename(invoice.name)
                     text = extract_text_from_invoice(invoice)
                     entries = extract_entries_from_text(text)
+
                     if show_name:
                         sheet_entries[show_name] = entries
+
                     extracted_rows.append({
                         "file": invoice.name,
                         "detected_show": show_name or "Not detected from filename",
-                        "extracted_text_preview": text[:800],
+                        "extracted_text_preview": text[:1000],
                         "entries": {k: v for k, v in entries.items() if v},
                     })
                 except Exception as exc:
@@ -298,17 +347,41 @@ def automated_ocr_processor():
                         "extracted_text_preview": str(exc),
                         "entries": {},
                     })
+
+        st.session_state["ocr_sheet_entries"] = sheet_entries
+        st.session_state["ocr_extracted_rows"] = extracted_rows
+        st.success("Extraction complete. Review the table below before creating Excel.")
+
+    if "ocr_sheet_entries" not in st.session_state:
+        return
+
+    st.subheader("Step 1: Review and correct extracted quantities")
+    st.caption("Edit any wrong numbers here. These corrected values will be written to the master Excel file.")
+
+    review_rows = entries_to_review_rows(st.session_state["ocr_sheet_entries"])
+    edited_rows = st.data_editor(
+        review_rows,
+        use_container_width=True,
+        num_rows="fixed",
+        disabled=["Show"],
+        key="ocr_review_editor",
+    )
+
+    with st.expander("Gemini raw output previews"):
+        st.dataframe(st.session_state.get("ocr_extracted_rows", []), use_container_width=True)
+
+    st.subheader("Step 2: Create Excel after review")
+    if st.button("Create completed Excel from reviewed values", type="primary"):
         try:
-            output, summary = build_download(master_file, sheet_entries)
-            st.success("Gemini extraction complete. Download your completed master file below.")
+            corrected_sheet_entries = review_rows_to_sheet_entries(edited_rows)
+            output, summary = build_download(master_file, corrected_sheet_entries)
+            st.success("Excel file created from reviewed values. Download your completed master file below.")
             st.download_button(
                 "Download completed Excel file",
                 data=output,
-                file_name="Fallen_Angels_Mastersheet_Gemini_Completed.xlsx",
+                file_name="Fallen_Angels_Mastersheet_Gemini_Reviewed_Completed.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.subheader("Detected invoice data")
-            st.dataframe(extracted_rows, use_container_width=True)
             st.subheader("Excel update summary")
             st.dataframe(summary, use_container_width=True)
         except Exception as exc:
