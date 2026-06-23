@@ -250,20 +250,12 @@ def extract_entries_from_invoice(uploaded_file, model):
     all_text = []
     for page in pages:
         img = page.convert("RGB")
-        # Try up to 2 times if response is malformed
-        for attempt in range(2):
-            try:
-                response = model.generate_content(
-                    [prompt, img],
-                    generation_config={"temperature": 0.0},  # deterministic
-                )
-                text = response.text or ""
-                if text.count("|") >= len(PRODUCTS) - 2:  # good response
-                    all_text.append(text)
-                    break
-            except Exception:
-                if attempt == 1:
-                    all_text.append("")
+        try:
+            response = model.generate_content([prompt, img])
+            text = response.text or ""
+            all_text.append(text)
+        except Exception as e:
+            all_text.append(f"ERROR: {e}")
     combined = "\n".join(all_text)
     return parse_gemini_output(combined), combined
 
@@ -419,7 +411,7 @@ def automated_ocr_processor():
                     "file": invoice.name,
                     "detected_show": show_name or "⚠️ Not detected",
                     "non_zero_items": {k: v for k, v in entries.items() if v > 0},
-                    "raw_text": raw_text[:800],
+                    "raw_text": raw_text,  # full text, not truncated
                 })
             except Exception as exc:
                 st.error(f"Could not extract {invoice.name}: {exc}")
@@ -434,10 +426,9 @@ def automated_ocr_processor():
         st.session_state["ocr_sheet_entries"] = sheet_entries
         st.session_state["ocr_raw_previews"] = raw_previews
         st.session_state["ocr_master_bytes"] = master_file.getvalue()
-        # Clear any stale editor state
-        for key in ["ocr_review_editor", "ocr_edited_entries"]:
-            if key in st.session_state:
-                del st.session_state[key]
+        # Clear stale editor state so fresh Gemini data populates the table
+        for key in ["ocr_edited_entries", "ocr_review_editor", "_creating_excel"]:
+            st.session_state.pop(key, None)
         st.success(f"✅ Extracted {len(invoice_files)} invoice(s). Review the table below.")
 
     if "ocr_sheet_entries" not in st.session_state:
@@ -446,24 +437,38 @@ def automated_ocr_processor():
     st.subheader("Step 1 — Review & correct extracted quantities")
     st.caption("Each row = one show/day. Edit any wrong values here. These are the RETAIL qty sold written into Column I.")
 
-    # Use session state directly - do NOT use a key on data_editor
-    # Pre-populate edited state from extraction results if not already set
+    # Always keep ocr_edited_entries in sync with ocr_sheet_entries
+    # but only initialize it — don't overwrite if user has edited
     if "ocr_edited_entries" not in st.session_state:
-        st.session_state["ocr_edited_entries"] = st.session_state["ocr_sheet_entries"].copy()
+        st.session_state["ocr_edited_entries"] = {
+            show: dict(prods)
+            for show, prods in st.session_state["ocr_sheet_entries"].items()
+        }
 
     review_rows = entries_to_review_rows(st.session_state["ocr_sheet_entries"])
 
-    # data_editor WITHOUT a key — returns fresh values every render based on review_rows
-    edited_rows = st.data_editor(
+    st.caption("💡 Edit values directly in the table below, then click Create Excel.")
+    edited_df = st.data_editor(
         review_rows,
         use_container_width=True,
         num_rows="fixed",
         disabled=["Show"],
+        key="ocr_review_editor",
     )
-    # Save to session state immediately so it survives button-click reruns
-    st.session_state["ocr_edited_entries"] = review_rows_to_sheet_entries(edited_rows)
 
-    with st.expander("🔬 Gemini raw output — use this to debug wrong values"):
+    # Persist whatever is currently in the editor into session state
+    # This runs on EVERY render, but we read it back only when button is clicked
+    try:
+        import pandas as pd
+        if isinstance(edited_df, pd.DataFrame):
+            edited_list = edited_df.to_dict("records")
+        else:
+            edited_list = edited_df
+        st.session_state["ocr_edited_entries"] = review_rows_to_sheet_entries(edited_list)
+    except Exception:
+        pass
+
+    with st.expander("🔬 Gemini raw output — check this if values are wrong", expanded=True):
         for preview in st.session_state.get("ocr_raw_previews", []):
             st.markdown(f"**{preview['file']}** → detected show: `{preview['detected_show']}`")
             col1, col2 = st.columns(2)
@@ -478,10 +483,16 @@ def automated_ocr_processor():
     st.subheader("Step 2 — Create Excel from reviewed values")
     if st.button("📥 Create completed Excel", type="primary"):
         try:
-            # Use session-state saved entries (survives the button-click rerun)
-            corrected = st.session_state.get("ocr_edited_entries",
-                        review_rows_to_sheet_entries(review_rows))
-            # Show what will be written
+            # Read directly from ocr_sheet_entries (the raw Gemini output)
+            # because ocr_edited_entries may have been re-zeroed by the rerun
+            # Use whichever has more non-zero values
+            gemini_entries = st.session_state["ocr_sheet_entries"]
+            edited_entries = st.session_state.get("ocr_edited_entries", gemini_entries)
+
+            gemini_total = sum(q for prods in gemini_entries.values() for q in prods.values())
+            edited_total = sum(q for prods in edited_entries.values() for q in prods.values())
+            corrected = edited_entries if edited_total >= gemini_total else gemini_entries
+
             non_zero_filtered = {
                 show: {p: q for p, q in prods.items() if q > 0}
                 for show, prods in corrected.items()
@@ -491,7 +502,7 @@ def automated_ocr_processor():
                 st.info("Values being written to Excel:")
                 st.write(non_zero_filtered)
             else:
-                st.warning("⚠️ All quantities are 0 — nothing will be written. Check the table above.")
+                st.warning("⚠️ All quantities are 0 — nothing will be written. Open the Gemini raw output above to see what was extracted.")
                 return
             master_bytes = st.session_state["ocr_master_bytes"]
             output, summary = build_download(master_bytes, corrected)
@@ -505,6 +516,8 @@ def automated_ocr_processor():
             st.dataframe(summary, use_container_width=True)
         except Exception as exc:
             st.error(f"Could not create Excel: {exc}")
+        finally:
+            st.session_state.pop("_creating_excel", None)
 
 
 def fallen_angels_manual_processor():
