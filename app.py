@@ -434,9 +434,10 @@ def automated_ocr_processor():
         st.session_state["ocr_sheet_entries"] = sheet_entries
         st.session_state["ocr_raw_previews"] = raw_previews
         st.session_state["ocr_master_bytes"] = master_file.getvalue()
-        # Clear cached editor state so fresh data shows correctly
-        if "ocr_review_editor" in st.session_state:
-            del st.session_state["ocr_review_editor"]
+        # Clear any stale editor state
+        for key in ["ocr_review_editor", "ocr_edited_entries"]:
+            if key in st.session_state:
+                del st.session_state[key]
         st.success(f"✅ Extracted {len(invoice_files)} invoice(s). Review the table below.")
 
     if "ocr_sheet_entries" not in st.session_state:
@@ -445,14 +446,22 @@ def automated_ocr_processor():
     st.subheader("Step 1 — Review & correct extracted quantities")
     st.caption("Each row = one show/day. Edit any wrong values here. These are the RETAIL qty sold written into Column I.")
 
+    # Use session state directly - do NOT use a key on data_editor
+    # Pre-populate edited state from extraction results if not already set
+    if "ocr_edited_entries" not in st.session_state:
+        st.session_state["ocr_edited_entries"] = st.session_state["ocr_sheet_entries"].copy()
+
     review_rows = entries_to_review_rows(st.session_state["ocr_sheet_entries"])
+
+    # data_editor WITHOUT a key — returns fresh values every render based on review_rows
     edited_rows = st.data_editor(
         review_rows,
         use_container_width=True,
         num_rows="fixed",
         disabled=["Show"],
-        key="ocr_review_editor",
     )
+    # Save to session state immediately so it survives button-click reruns
+    st.session_state["ocr_edited_entries"] = review_rows_to_sheet_entries(edited_rows)
 
     with st.expander("🔬 Gemini raw output — use this to debug wrong values"):
         for preview in st.session_state.get("ocr_raw_previews", []):
@@ -469,15 +478,21 @@ def automated_ocr_processor():
     st.subheader("Step 2 — Create Excel from reviewed values")
     if st.button("📥 Create completed Excel", type="primary"):
         try:
-            corrected = review_rows_to_sheet_entries(edited_rows)
-            # Show what will be written so user can verify before downloading
-            non_zero = {show: {p: q for p, q in prods.items() if q > 0}
-                        for show, prods in corrected.items()}
-            non_zero_filtered = {s: v for s, v in non_zero.items() if v}
+            # Use session-state saved entries (survives the button-click rerun)
+            corrected = st.session_state.get("ocr_edited_entries",
+                        review_rows_to_sheet_entries(review_rows))
+            # Show what will be written
+            non_zero_filtered = {
+                show: {p: q for p, q in prods.items() if q > 0}
+                for show, prods in corrected.items()
+                if any(q > 0 for q in prods.values())
+            }
             if non_zero_filtered:
-                st.info("Values being written to Excel: " + str(non_zero_filtered))
+                st.info("Values being written to Excel:")
+                st.write(non_zero_filtered)
             else:
-                st.warning("⚠️ All quantities are 0 — nothing will be written. Check the review table above.")
+                st.warning("⚠️ All quantities are 0 — nothing will be written. Check the table above.")
+                return
             master_bytes = st.session_state["ocr_master_bytes"]
             output, summary = build_download(master_bytes, corrected)
             st.success("Excel ready! Download below.")
