@@ -351,14 +351,25 @@ def entries_to_review_rows(sheet_entries):
 
 
 def review_rows_to_sheet_entries(rows):
+    """Convert data_editor output (list of dicts OR DataFrame) to sheet_entries dict."""
     sheet_entries = {show: {p: 0 for p in PRODUCTS} for show in SHOWS}
+
+    # Handle both DataFrame and list-of-dicts (Streamlit returns DataFrame in newer versions)
+    try:
+        import pandas as pd
+        if isinstance(rows, pd.DataFrame):
+            rows = rows.to_dict("records")
+    except ImportError:
+        pass
+
     for row in rows:
         show = row.get("Show")
         if show not in sheet_entries:
             continue
         for p in PRODUCTS:
             try:
-                sheet_entries[show][p] = int(row.get(p, 0) or 0)
+                val = row.get(p, 0)
+                sheet_entries[show][p] = int(val) if val not in (None, "", "None") else 0
             except Exception:
                 sheet_entries[show][p] = 0
     return sheet_entries
@@ -401,10 +412,9 @@ def automated_ocr_processor():
                 entries, raw_text = extract_entries_from_invoice(invoice, model)
 
                 if show_name:
-                    # Merge: add to existing (in case multiple invoices per show)
                     for p, qty in entries.items():
                         sheet_entries[show_name][p] = sheet_entries[show_name].get(p, 0) + qty
-                
+
                 raw_previews.append({
                     "file": invoice.name,
                     "detected_show": show_name or "⚠️ Not detected",
@@ -424,6 +434,9 @@ def automated_ocr_processor():
         st.session_state["ocr_sheet_entries"] = sheet_entries
         st.session_state["ocr_raw_previews"] = raw_previews
         st.session_state["ocr_master_bytes"] = master_file.getvalue()
+        # Clear cached editor state so fresh data shows correctly
+        if "ocr_review_editor" in st.session_state:
+            del st.session_state["ocr_review_editor"]
         st.success(f"✅ Extracted {len(invoice_files)} invoice(s). Review the table below.")
 
     if "ocr_sheet_entries" not in st.session_state:
@@ -457,6 +470,14 @@ def automated_ocr_processor():
     if st.button("📥 Create completed Excel", type="primary"):
         try:
             corrected = review_rows_to_sheet_entries(edited_rows)
+            # Show what will be written so user can verify before downloading
+            non_zero = {show: {p: q for p, q in prods.items() if q > 0}
+                        for show, prods in corrected.items()}
+            non_zero_filtered = {s: v for s, v in non_zero.items() if v}
+            if non_zero_filtered:
+                st.info("Values being written to Excel: " + str(non_zero_filtered))
+            else:
+                st.warning("⚠️ All quantities are 0 — nothing will be written. Check the review table above.")
             master_bytes = st.session_state["ocr_master_bytes"]
             output, summary = build_download(master_bytes, corrected)
             st.success("Excel ready! Download below.")
