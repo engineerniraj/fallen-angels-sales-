@@ -182,82 +182,123 @@ def get_gemini_model():
 
 
 def build_gemini_prompt():
-    product_list = "\n".join(f"- {p}" for p in PRODUCTS)
-    return f"""You are reading a handwritten FALLEN ANGELS merchandise sales sheet.
+    # Build the exact expected output block so Gemini knows the format
+    example_lines = "\n".join(f"{p}|0" for p in PRODUCTS)
+    return f"""You are reading a handwritten FALLEN ANGELS merchandise sales sheet image.
 
-The sheet has columns: ITEM | SIZE | RETAIL price | STAFF price | PRE | ADD | START | END | PROMO | RETAIL qty | STAFF qty | $RETAIL | $STAFF
+=== SHEET COLUMN LAYOUT (left to right) ===
+ITEM | SIZE | RETAIL_PRICE | STAFF_PRICE | PRE | ADD | START | END | PROMO | RETAIL_QTY | STAFF_QTY | $RETAIL | $STAFF
 
-Your job:
-1. Find the RETAIL quantity sold for each product listed below.
-2. HOW TO CALCULATE "sold":
-   - If the "RETAIL qty" column (after PROMO) is filled in, use that number directly.
-   - If "RETAIL qty" is blank, calculate: START - END = sold.
-   - If both are blank or unreadable, return 0.
-3. DO NOT use the "$RETAIL" dollar column — only the qty column.
+=== YOUR ONLY JOB ===
+For each product row, find HOW MANY UNITS were SOLD at RETAIL.
 
-Products to extract (use EXACTLY these names):
-{product_list}
+=== HOW TO FIND THE SOLD QTY ===
+Step 1: Look at the RETAIL_QTY column (the column RIGHT AFTER the PROMO column).
+        - If it has a handwritten number → that IS the sold qty. Use it directly.
+Step 2: If RETAIL_QTY is blank or empty:
+        - Calculate: sold = START - END
+        - If START = END → sold = 0
+        - If START or END is unreadable → sold = 0
+Step 3: NEVER use the $RETAIL column (dollar amounts like $25, $180) — those are dollar totals, not qty.
+Step 4: NEVER use PRE or ADD columns for qty.
 
-Return EXACTLY {len(PRODUCTS)} lines in this format:
-PRODUCT_NAME|QTY
+=== PRODUCTS TO EXTRACT ===
+The invoice sheet has these sections IN THIS ORDER:
+1. POSTER (single row)
+2. MAGNET (single row)
+3. LAPEL PIN (single row)
+4. KEYCHAIN (single row)
+5. MUG (single row)
+6. TOTE (single row)
+7. LOGO (FITTED) tee — rows for S, M, L, XL, XXL
+8. LAPSE TEE (UNISEX) — rows for S, M, L, XL, XXL
+9. HOODIE — rows for S, M, L, XL, XXL
 
-Rules:
-- Match shirt sizes CAREFULLY: S, M, L, XL, XXL are different rows.
-- Logo Tee and Lapse Tee are separate product families — do not mix them.
-- Hoodie is separate from tees.
-- If a row is blank, illegible, or has START=END, return 0.
-- Return ONLY the {len(PRODUCTS)} lines. No markdown, no explanations, no extra text.
+=== SIZE MATCHING RULES ===
+- Each size (S, M, L, XL, XXL) is a SEPARATE row. Read each row individually.
+- S and XL look similar in handwriting — check carefully.
+- XXL and XL are DIFFERENT. XXL has two X's.
+- Logo Tee and Lapse Tee are COMPLETELY SEPARATE sections. Do not mix them.
+- Hoodie is separate from all tees.
 
-Example output:
-Poster|1
-Magnet|12
-Lapel Pin|4
-...
-"""
+=== OUTPUT FORMAT ===
+Return EXACTLY {len(PRODUCTS)} lines. No extra text, no markdown, no explanations.
+Format: PRODUCT_NAME|NUMBER
+
+Expected output (fill in correct numbers):
+{example_lines}"""
 
 
 def images_from_upload(uploaded_file):
     file_bytes = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
     if name.endswith(".pdf"):
-        pages = convert_from_bytes(file_bytes, dpi=220)
+        pages = convert_from_bytes(file_bytes, dpi=300)
         return pages
     img = Image.open(io.BytesIO(file_bytes))
+    # Upscale small images for better OCR
+    if img.width < 1500:
+        scale = 1500 / img.width
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
     return [img]
 
 
 def extract_entries_from_invoice(uploaded_file, model):
-    """Run Gemini OCR on one invoice file. Returns dict {product: qty}."""
+    """Run Gemini OCR on one invoice file. Returns dict {product: qty} and raw text."""
     pages = images_from_upload(uploaded_file)
     prompt = build_gemini_prompt()
     all_text = []
     for page in pages:
         img = page.convert("RGB")
-        response = model.generate_content([prompt, img])
-        all_text.append(response.text or "")
+        # Try up to 2 times if response is malformed
+        for attempt in range(2):
+            try:
+                response = model.generate_content(
+                    [prompt, img],
+                    generation_config={"temperature": 0.0},  # deterministic
+                )
+                text = response.text or ""
+                if text.count("|") >= len(PRODUCTS) - 2:  # good response
+                    all_text.append(text)
+                    break
+            except Exception:
+                if attempt == 1:
+                    all_text.append("")
     combined = "\n".join(all_text)
     return parse_gemini_output(combined), combined
 
 
 def parse_gemini_output(text):
-    """Parse Gemini's PRODUCT|QTY output into a dict."""
+    """Parse Gemini's PRODUCT|QTY output into a dict. Robust to minor formatting issues."""
     entries = {p: 0 for p in PRODUCTS}
     normalized_map = {p.strip().lower(): p for p in PRODUCTS}
 
     for line in text.splitlines():
         line = line.strip()
+        # Remove any markdown artifacts
+        line = line.lstrip("- *#").strip()
         if "|" not in line:
             continue
         parts = line.split("|", 1)
-        raw_label = parts[0].strip()
+        raw_label = parts[0].strip().rstrip(":")
         raw_qty = parts[1].strip() if len(parts) > 1 else "0"
 
         label = normalized_map.get(raw_label.lower())
         if not label:
+            # Try partial match as fallback
+            for key, canonical in normalized_map.items():
+                if raw_label.lower() in key or key in raw_label.lower():
+                    label = canonical
+                    break
+        if not label:
             continue
 
-        numbers = re.findall(r"\b\d+\b", raw_qty)
-        entries[label] = int(numbers[-1]) if numbers else 0
+        # Extract the number — take the first reasonable number (not 0 if others exist)
+        numbers = [int(n) for n in re.findall(r"\b\d+\b", raw_qty)]
+        if numbers:
+            # Sanity check: qty sold per show is unlikely to exceed 50
+            qty = numbers[0] if numbers[0] <= 50 else 0
+            entries[label] = qty
 
     return entries
 
@@ -400,11 +441,16 @@ def automated_ocr_processor():
         key="ocr_review_editor",
     )
 
-    with st.expander("Gemini raw output / detection preview"):
+    with st.expander("🔬 Gemini raw output — use this to debug wrong values"):
         for preview in st.session_state.get("ocr_raw_previews", []):
             st.markdown(f"**{preview['file']}** → detected show: `{preview['detected_show']}`")
-            st.write("Non-zero items:", preview["non_zero_items"])
-            st.code(preview["raw_text"], language="text")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.caption("Non-zero items extracted:")
+                st.write(preview["non_zero_items"] or "None")
+            with col2:
+                st.caption("Raw Gemini response:")
+                st.code(preview["raw_text"], language="text")
             st.divider()
 
     st.subheader("Step 2 — Create Excel from reviewed values")
